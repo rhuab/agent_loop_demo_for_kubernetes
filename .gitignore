@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Agent run traces (full conversation replays, may contain cluster details)
+traces/

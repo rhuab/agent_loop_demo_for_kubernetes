@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -56,11 +57,48 @@ The report must include: a cluster overview (counts of nodes/namespaces/pods and
 DEFAULT_QUESTION = "Give this Kubernetes cluster a full health check: find every unhealthy pod and analyze the root cause."
 
 MAX_RESULT_PREVIEW = 400  # preview length for tool results in the log, to avoid flooding the terminal
+MAX_REPEATS = 3  # identical (tool, args) calls tolerated before forcing a summary
 
 
 def _preview(text: str, limit: int = MAX_RESULT_PREVIEW) -> str:
     one_line = " ".join(text.split())
     return one_line if len(one_line) <= limit else one_line[:limit] + " ...[truncated]"
+
+
+def _save_trace(messages: list, cfg: dict, question: str) -> None:
+    """Save the full conversation of a run to traces/<timestamp>.jsonl.
+
+    One JSON object per line: a leading "_meta" record, then every
+    message (system / user / assistant with tool_calls / tool results),
+    so a run can be replayed later to see what the model saw, called
+    and concluded. Never raises: a failed trace must not fail the run.
+    """
+    try:
+        traces_dir = Path(__file__).parent / "traces"
+        traces_dir.mkdir(exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:21]
+        path = traces_dir / f"run-{stamp}.jsonl"
+        meta = {
+            "role": "_meta",
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "model": cfg["model"],
+            "question": question,
+            "mcp_server": " ".join(cfg["mcp_command"]),
+            "max_steps": cfg["max_steps"],
+        }
+        with path.open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps(meta, ensure_ascii=False) + "\n")
+            for msg in messages:
+                if isinstance(msg, dict):
+                    record = msg
+                elif hasattr(msg, "model_dump"):
+                    record = msg.model_dump()
+                else:
+                    record = {"role": "unknown", "content": str(msg)}
+                fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        logger.info("Trace saved to %s", path)
+    except Exception as exc:  # trace is best-effort diagnostics only
+        logger.warning("Failed to save trace: %s", exc)
 
 
 def _load_config() -> dict:
@@ -105,6 +143,10 @@ async def run_agent(question: str) -> str:
             {"role": "user", "content": question},
         ]
 
+        seen: dict[str, str] = {}  # (tool, args) signature -> result, for duplicate detection
+        repeat_count = 0
+        tool_calls_made = 0
+
         # ------------------------- Agent Loop -------------------------
         for step in range(1, cfg["max_steps"] + 1):
             logger.info("--- Step %d: requesting LLM ---", step)
@@ -112,6 +154,9 @@ async def run_agent(question: str) -> str:
                 model=cfg["model"],
                 messages=messages,
                 tools=tools,
+                # Step 1 must investigate, not answer from thin air; later
+                # steps use "auto" so the model is free to stop and report.
+                tool_choice="required" if step == 1 else "auto",
             )
             msg = resp.choices[0].message
             # Append the assistant message as-is (it must keep tool_calls,
@@ -119,10 +164,24 @@ async def run_agent(question: str) -> str:
             messages.append(msg)
 
             if not msg.tool_calls:
+                if tool_calls_made == 0 and step < cfg["max_steps"]:
+                    # Model answered without investigating (can happen when
+                    # a provider ignores tool_choice): push back once and
+                    # let it retry instead of accepting an invented report.
+                    logger.warning("Model answered without calling any tool; pushing back")
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": "You have not called any tool yet. Investigate the cluster with the provided tools before answering.",
+                        }
+                    )
+                    continue
                 answer = msg.content or ""
                 logger.info("===== Final Report =====\n%s", answer)
+                _save_trace(messages, cfg, question)
                 return answer
 
+            force_summary = False
             # Execute every tool call the model requested this step
             for tc in msg.tool_calls:
                 name = tc.function.name
@@ -137,17 +196,40 @@ async def run_agent(question: str) -> str:
                     continue
 
                 logger.info("[tool] %s(%s)", name, json.dumps(args, ensure_ascii=False))
-                result = await mcp.call_tool(name, args)
+                tool_calls_made += 1
+                sig = f"{name}:{json.dumps(args, ensure_ascii=False, sort_keys=True)}"
+                if sig in seen:
+                    repeat_count += 1
+                    logger.warning(
+                        "[repeat %d/%d] duplicate call %s, returning cached result",
+                        repeat_count, MAX_REPEATS, sig,
+                    )
+                    result = (
+                        "[Duplicate call] You already called this tool with identical "
+                        "arguments; the result has not changed. Base your next step on "
+                        "it, try a different tool, or write the final report.\n" + seen[sig]
+                    )
+                    if repeat_count >= MAX_REPEATS:
+                        # Do not break mid-round: every tool_call in this
+                        # assistant message still needs a matching tool
+                        # message, or the next request would be rejected.
+                        force_summary = True
+                else:
+                    result = await mcp.call_tool(name, args)
+                    seen[sig] = result
                 logger.info("[result] %s", _preview(result))
                 messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": result}
                 )
+            if force_summary:
+                logger.warning("Too many duplicate tool calls, forcing a summary...")
+                break
         # ------------------------ End of loop -------------------------
 
-        # Max steps reached without converging: withhold tools and force
-        # the model to summarize from what it already has, so we never
-        # loop forever burning tokens.
-        logger.warning("Reached max steps (%d), forcing a summary...", cfg["max_steps"])
+        # Loop ended without converging (max steps reached or too many
+        # duplicate calls): withhold tools and force the model to
+        # summarize from what it already has, so we never loop forever.
+        logger.warning("Forcing a summary (max_steps=%d, repeats=%d)...", cfg["max_steps"], repeat_count)
         messages.append(
             {
                 "role": "user",
@@ -159,6 +241,7 @@ async def run_agent(question: str) -> str:
         )
         answer = resp.choices[0].message.content or ""
         logger.info("===== Final Report (forced summary) =====\n%s", answer)
+        _save_trace(messages, cfg, question)
         return answer
 
 
