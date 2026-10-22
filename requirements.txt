@@ -1,0 +1,5 @@
+# mcp 2.x renamed APIs such as FastMCP; this demo is written against the 1.x FastMCP / ClientSession API
+mcp>=1.0,<2
+openai>=1.30
+python-dotenv>=1.0
+pytest>=8.0
