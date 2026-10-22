@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -60,6 +61,11 @@ DEFAULT_QUESTION = "Give this Kubernetes cluster a full health check: find every
 
 MAX_RESULT_PREVIEW = 400  # preview length for tool results in the log, to avoid flooding the terminal
 MAX_REPEATS = 3  # identical (tool, args) calls tolerated before forcing a summary
+
+# Deployment-style pod names look like "payment-service-6f7b8d9c0-ghi56":
+# at least three hyphen-separated segments (plain names like "node-03" or
+# "kube-system" have only one hyphen and are not matched).
+POD_NAME_RE = re.compile(r"\b[a-z0-9]+(?:-[a-z0-9]+){2,}\b")
 
 
 def _preview(text: str, limit: int = MAX_RESULT_PREVIEW) -> str:
@@ -125,6 +131,11 @@ def _build_validators(tools: list[dict]) -> dict:
     return validators
 
 
+def _invented_pods(answer: str, evidence: str) -> list[str]:
+    """Pod-like names mentioned in the answer that no tool result contains."""
+    return sorted({name for name in POD_NAME_RE.findall(answer) if name not in evidence})
+
+
 def _load_config() -> dict:
     load_dotenv()
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -171,6 +182,8 @@ async def run_agent(question: str) -> str:
         seen: dict[str, str] = {}  # (tool, args) signature -> result, for duplicate detection
         repeat_count = 0
         tool_calls_made = 0
+        known_tools = set(validators)  # whitelist of tools the server actually offers
+        evidence_pushback_done = False
 
         # ------------------------- Agent Loop -------------------------
         for step in range(1, cfg["max_steps"] + 1):
@@ -202,6 +215,25 @@ async def run_agent(question: str) -> str:
                     )
                     continue
                 answer = msg.content or ""
+                # Evidence check: every pod named in the report must have
+                # appeared in some tool result. Push back at most once;
+                # after that, accept the answer (MAX_STEPS still bounds us).
+                if not evidence_pushback_done and step < cfg["max_steps"]:
+                    invented = _invented_pods(answer, "\n".join(seen.values()))
+                    if invented:
+                        evidence_pushback_done = True
+                        logger.warning("Report mentions pods absent from tool results: %s", invented)
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Your report mentions these pods, which never appeared in any tool result: "
+                                    f"{', '.join(invented)}. Remove or correct them and only cite pods, "
+                                    "nodes and events returned by the tools."
+                                ),
+                            }
+                        )
+                        continue
                 logger.info("===== Final Report =====\n%s", answer)
                 _save_trace(messages, cfg, question)
                 return answer
@@ -222,6 +254,18 @@ async def run_agent(question: str) -> str:
 
                 logger.info("[tool] %s(%s)", name, json.dumps(args, ensure_ascii=False))
                 tool_calls_made += 1
+
+                # Whitelist check: the model may hallucinate a tool name.
+                if name not in known_tools:
+                    logger.warning("[unknown tool] %s", name)
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": f"Unknown tool '{name}'. Available tools: {', '.join(sorted(known_tools))}.",
+                        }
+                    )
+                    continue
 
                 # Pre-flight check: reject arguments that violate the
                 # tool's JSON Schema before spending an MCP call on them,

@@ -366,7 +366,9 @@ def list_pods(namespace: str = "all") -> str:
 def describe_pod(name: str, namespace: str) -> str:
     """Describe a single pod in detail: containers, images, labels,
     conditions and the events related to this pod.
-    Use this to investigate a pod that is not running.
+    Use this to investigate a pod that is not running. The response
+    already includes this pod's events, so do not call get_events
+    for the same pod; use get_pod_logs next if it is CrashLoopBackOff.
     """
     pod = _find_pod(name, namespace)
     if pod is None:
@@ -395,6 +397,9 @@ def describe_pod(name: str, namespace: str) -> str:
 def get_pod_logs(name: str, namespace: str, tail: int = 20) -> str:
     """Get recent logs of a pod. Use this for CrashLoopBackOff or
     otherwise failing pods to find the application-level error.
+    Do not use this for ImagePullBackOff or Pending pods: their
+    containers never started, so no logs exist; use describe_pod
+    and get_events for those instead.
     """
     pod = _find_pod(name, namespace)
     if pod is None:
@@ -425,7 +430,9 @@ def list_nodes() -> str:
 def get_events(namespace: str = "all") -> str:
     """List cluster events (especially Warning events) in a namespace,
     or all namespaces when namespace="all". Useful for finding
-    scheduling failures and image pull errors.
+    scheduling failures and image pull errors across several pods.
+    For a single pod's events, prefer describe_pod, which already
+    includes them.
     """
     events = [e for e in EVENTS if namespace == "all" or e["namespace"] == namespace]
     return _dump({"namespace": namespace, "count": len(events), "events": events})
