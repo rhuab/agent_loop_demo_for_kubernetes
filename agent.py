@@ -25,6 +25,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
 from openai import AsyncOpenAI
 from mcp_client import MCPClient, parse_command
 
@@ -101,6 +103,28 @@ def _save_trace(messages: list, cfg: dict, question: str) -> None:
         logger.warning("Failed to save trace: %s", exc)
 
 
+def _build_validators(tools: list[dict]) -> dict:
+    """Compile one JSON Schema validator per tool, from its MCP inputSchema.
+
+    A tool whose schema is itself invalid is skipped (with a warning)
+    rather than breaking the run: its calls fall back to server-side
+    validation, exactly as before this check existed.
+    """
+    validators = {}
+    for tool in tools:
+        fn = tool.get("function", {}) if isinstance(tool, dict) else {}
+        name = fn.get("name")
+        if not name:
+            continue
+        schema = fn.get("parameters") or {"type": "object"}
+        try:
+            Draft202012Validator.check_schema(schema)
+            validators[name] = Draft202012Validator(schema)
+        except SchemaError as exc:
+            logger.warning("Skipping argument validation for %s: invalid schema: %s", name, exc.message)
+    return validators
+
+
 def _load_config() -> dict:
     load_dotenv()
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -136,6 +160,7 @@ async def run_agent(question: str) -> str:
 
     async with MCPClient(cfg["mcp_command"]) as mcp:
         tools = await mcp.list_tools_openai()
+        validators = _build_validators(tools)
         logger.info("Connected to MCP server, available tools: %s", await mcp.tool_names())
 
         messages: list[dict] = [
@@ -197,6 +222,34 @@ async def run_agent(question: str) -> str:
 
                 logger.info("[tool] %s(%s)", name, json.dumps(args, ensure_ascii=False))
                 tool_calls_made += 1
+
+                # Pre-flight check: reject arguments that violate the
+                # tool's JSON Schema before spending an MCP call on them,
+                # and tell the model exactly what to fix.
+                validator = validators.get(name)
+                if validator is not None:
+                    errors = sorted(
+                        validator.iter_errors(args),
+                        key=lambda e: [str(p) for p in e.absolute_path],
+                    )
+                    if errors:
+                        detail = "; ".join(
+                            f"{'.'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}"
+                            for e in errors
+                        )
+                        logger.warning("[invalid args] %s: %s", name, detail)
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": (
+                                    f"Invalid arguments for {name}: {detail}. "
+                                    "Fix the arguments according to the tool's schema and try again."
+                                ),
+                            }
+                        )
+                        continue
+
                 sig = f"{name}:{json.dumps(args, ensure_ascii=False, sort_keys=True)}"
                 if sig in seen:
                     repeat_count += 1
